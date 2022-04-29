@@ -22,5 +22,7 @@
     };
 
     defaultBundler = self.bundlers.nix-bundle;
+
+    lib = import ./.;
   };
 }
