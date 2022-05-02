@@ -26,7 +26,7 @@
 using namespace std;
 
 #define err_exit(format, ...) { fprintf(stderr, format ": %s\n", ##__VA_ARGS__, strerror(errno)); exit(EXIT_FAILURE); }
-static int child_proc(const char *rootdir, const char *nixdir, uint8_t clear_env, list<struct DirMapping> dirMappings, list<struct SetEnv> envMappings, const char *executable, char * const new_argv[]);
+static int child_proc(const char *rootdir, const char *nixdir, uint8_t clear_env, bool root_mode, bool first_run, list<struct DirMapping> dirMappings, list<struct SetEnv> envMappings, const char *executable, char * const new_argv[]);
 
 volatile uint8_t child_died = 0;
 int child_pid = 0;
@@ -38,6 +38,7 @@ static void usage(const char *pname) {
     fprintf(stderr, "\t-d\tdelete all default dir mappings, may break things\n");
     fprintf(stderr, "\t-p <var>\tpreserve the value of a variable across the -c clear\n");
     fprintf(stderr, "\t-e\tadd an /escape-hatch to the sandbox, and run (outside the sandbox) any strings written to it\n");
+    fprintf(stderr, "\t-r\trun in root mode (don't do chroot)\n");
 
     exit(EXIT_FAILURE);
 }
@@ -109,6 +110,8 @@ int main(int argc, char *argv[]) {
   list<struct DirMapping> dirMappings;
   list<struct SetEnv> envMappings;
   const char *t;
+  bool root_mode = false;
+  bool first_run = true;
 
 #define x(y) dirMappings.push_back({ "/" y, y })
   x("dev");
@@ -124,7 +127,7 @@ int main(int argc, char *argv[]) {
 #undef x
 
   int opt;
-  while ((opt = getopt(argc, argv, "cen:m:dp:")) != -1) {
+  while ((opt = getopt(argc, argv, "cen:m:dp:r")) != -1) {
     switch (opt) {
     case 'c':
       clear_env = 1;
@@ -150,6 +153,9 @@ int main(int argc, char *argv[]) {
       if (t) {
         envMappings.push_back({ optarg, t });
       }
+      break;
+    case 'r':
+      root_mode = true;
       break;
     }
   }
@@ -194,6 +200,10 @@ int main(int argc, char *argv[]) {
     err_exit("sigaction()");
   }
 
+  const char *nix_chroot = getenv("NIX_CHROOT");
+  if (nix_chroot)
+    first_run = false;
+
   int child;
   child = child_pid = fork();
   if (child < 0) {
@@ -204,7 +214,7 @@ int main(int argc, char *argv[]) {
     char buf[10];
     read(unrace[0], buf, 10);
     close(unrace[0]);
-    return child_proc(rootdir, nixdir, clear_env, dirMappings, envMappings, argv[optind], argv + optind);
+    return child_proc(rootdir, nixdir, clear_env, root_mode, first_run, dirMappings, envMappings, argv[optind], argv + optind);
   } else {
     close(unrace[0]);
     char fifopath[PATH_MAX];
@@ -230,30 +240,43 @@ int main(int argc, char *argv[]) {
     }
     int status;
     int ret = waitpid(child, &status, 0);
+    // cleanup
+    if (root_mode) {
+      if (first_run) {
+        umount2("/nix", MNT_DETACH);
+        rmdir("/nix");
+      }
+      rmdir(rootdir);
+    }
     return WEXITSTATUS(status);
   }
 }
 
-static int child_proc(const char *rootdir, const char *nixdir, uint8_t clear_env, list<struct DirMapping> dirMappings, list<struct SetEnv> envMappings, const char *executable, char * const new_argv[]) {
-  // get uid, gid before going to new namespace
-  uid_t uid = getuid();
-  gid_t gid = getgid();
+static int child_proc(const char *rootdir, const char *nixdir, uint8_t clear_env, bool root_mode, bool first_run, list<struct DirMapping> dirMappings, list<struct SetEnv> envMappings, const char *executable, char * const new_argv[]) {
+  uid_t uid;
+  gid_t gid;
 
-  // "unshare" into new namespace
-  if (unshare(CLONE_NEWNS | CLONE_NEWUSER) < 0) {
-    if (errno == EPERM) {
-      fputs("Run the following to enable unprivileged namespace use:\nsudo bash -c \"sysctl -w kernel.unprivileged_userns_clone=1 ; echo kernel.unprivileged_userns_clone=1 > /etc/sysctl.d/nix-user-chroot.conf\"\n\n", stderr);
-      exit(EXIT_FAILURE);
-    } else {
-      err_exit("unshare()");
+  if (!root_mode) {
+    // get uid, gid before going to new namespace
+    uid = getuid();
+    gid = getgid();
+
+    // "unshare" into new namespace
+    if (unshare(CLONE_NEWNS | CLONE_NEWUSER) < 0) {
+      if (errno == EPERM) {
+        fputs("Run the following to enable unprivileged namespace use:\nsudo bash -c \"sysctl -w kernel.unprivileged_userns_clone=1 ; echo kernel.unprivileged_userns_clone=1 > /etc/sysctl.d/nix-user-chroot.conf\"\n\n", stderr);
+        exit(EXIT_FAILURE);
+      } else {
+        err_exit("unshare()");
+      }
     }
-  }
 
-  // add necessary system stuff to rootdir namespace
-  for (list<struct DirMapping>::iterator it = dirMappings.begin();
-      it != dirMappings.end(); ++it) {
-    struct DirMapping m = *it;
-    add_path(m.src, m.dest, rootdir);
+    // add necessary system stuff to rootdir namespace
+    for (list<struct DirMapping>::iterator it = dirMappings.begin();
+        it != dirMappings.end(); ++it) {
+      struct DirMapping m = *it;
+      add_path(m.src, m.dest, rootdir);
+    }
   }
 
   // make sure nixdir exists
@@ -262,44 +285,65 @@ static int child_proc(const char *rootdir, const char *nixdir, uint8_t clear_env
     err_exit("stat(%s)", nixdir);
   }
 
-  char path_buf[PATH_MAX];
-  // mount /nix to new namespace
-  snprintf(path_buf, sizeof(path_buf), "%s/nix", rootdir);
-  mkdir(path_buf, statbuf2.st_mode & ~S_IFMT);
-  if (mount(nixdir, path_buf, "none", MS_BIND | MS_REC, NULL) < 0) {
-    err_exit("mount(%s, %s)", nixdir, path_buf);
-  }
+  if (!root_mode) {
+    char path_buf[PATH_MAX];
+    // mount /nix to new namespace
+    snprintf(path_buf, sizeof(path_buf), "%s/nix", rootdir);
+    mkdir(path_buf, statbuf2.st_mode & ~S_IFMT);
+    if (mount(nixdir, path_buf, "none", MS_BIND | MS_REC, NULL) < 0) {
+      err_exit("mount(%s, %s)", nixdir, path_buf);
+    }
 
-  // fixes issue #1 where writing to /proc/self/gid_map fails
-  // see user_namespaces(7) for more documentation
-  int fd_setgroups = open("/proc/self/setgroups", O_WRONLY);
-  if (fd_setgroups > 0) {
-    write(fd_setgroups, "deny", 4);
-    close(fd_setgroups);
-  }
+    // fixes issue #1 where writing to /proc/self/gid_map fails
+    // see user_namespaces(7) for more documentation
+    int fd_setgroups = open("/proc/self/setgroups", O_WRONLY);
+    if (fd_setgroups > 0) {
+      write(fd_setgroups, "deny", 4);
+      close(fd_setgroups);
+    }
 
-  // map the original uid/gid in the new ns
-  char map_buf[1024];
-  snprintf(map_buf, sizeof(map_buf), "%d %d 1", uid, uid);
-  update_map(map_buf, "/proc/self/uid_map");
-  snprintf(map_buf, sizeof(map_buf), "%d %d 1", gid, gid);
-  update_map(map_buf, "/proc/self/gid_map");
+    // map the original uid/gid in the new ns
+    char map_buf[1024];
+    snprintf(map_buf, sizeof(map_buf), "%d %d 1", uid, uid);
+    update_map(map_buf, "/proc/self/uid_map");
+    snprintf(map_buf, sizeof(map_buf), "%d %d 1", gid, gid);
+    update_map(map_buf, "/proc/self/gid_map");
 
-  // chroot to rootdir
-  if (chroot(rootdir) < 0) {
-    err_exit("chroot(%s)", rootdir);
+    // chroot to rootdir
+    if (chroot(rootdir) < 0) {
+      err_exit("chroot(%s)", rootdir);
+    }
+  } else if (first_run) {
+    mkdir("/nix", statbuf2.st_mode & ~S_IFMT);
+    if (mount(nixdir, "/nix", "none", MS_BIND | MS_REC, NULL) < 0) {
+      err_exit("mount(%s, %s)", nixdir, "/nix");
+    }
   }
 
   chdir("/");
 
   if (clear_env) clearenv();
-  setenv("PATH", ENV_PATH, 1);
+  if (!root_mode)
+    setenv("PATH", ENV_PATH, 1);
+  else {
+    if (ENV_PATH[0] != '\0') {
+      char *path = getenv("PATH");
+      if (path == NULL || path[0] == '\0')
+        setenv("PATH", ENV_PATH, 1);
+      else {
+        char new_path[PATH_MAX];
+        snprintf(new_path, sizeof(new_path), "%s:%s", ENV_PATH, path);
+        setenv("PATH", new_path, 1);
+      }
+    }
+  }
 
   for (list<struct SetEnv>::iterator it = envMappings.begin();
        it != envMappings.end(); ++it) {
     struct SetEnv e = *it;
     setenv(e.key.c_str(), e.value.c_str(), 1);
   }
+  setenv("NIX_CHROOT", "yes", 0);
 
   // execute the command
   execvp(executable, new_argv);
