@@ -112,8 +112,8 @@ in rec {
       makeFlags = o.makeFlags ++ [
         ''ENV_PATH="${lib.makeBinPath targets}"''
       ];
-    }); in { target, extraTargets ? [], run, initScript ? "" }: nix-bootstrap {
-      inherit target extraTargets run initScript;
+    }); in { target, extraTargets ? [], run, initScript ? "", nixUserChrootFlags ? "" }: nix-bootstrap {
+      inherit target extraTargets run initScript nixUserChrootFlags;
       nix-user-chroot' = nix-user-chroot'' extraTargets;
     };
 }
